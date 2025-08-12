@@ -3374,8 +3374,14 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2 0.10.8",
+ "swc_common",
  "swc_core",
+ "swc_ecma_codegen",
+ "swc_ecma_parser",
+ "swc_ecma_transforms_base",
+ "swc_ecma_transforms_testing",
  "swc_icu_messageformat_parser",
+ "testing",
 ]
 
 [[package]]

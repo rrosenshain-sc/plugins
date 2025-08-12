@@ -400,4 +400,21 @@ describe("formatjs swc plugin", () => {
     expect(hexOutput).toMatch(/id: "[0-9a-f]{9}"/);
     expect(base64UrlOutput).toMatch(/id: "[a-zA-Z0-9-_]{12}"/);
   });
+
+  it("should support concatenated string literals in defineMessage", async () => {
+    const input = `
+      import { defineMessage } from 'react-intl';
+
+      const msg = defineMessage({
+        defaultMessage: "Foo " + "Bar",
+        description: "foobar",
+      });
+    `;
+
+    const output = await transformCode(input);
+
+    expect(output).toMatch(/id: "[^"]+"/);
+    expect(output).toMatch(/defaultMessage: "Foo Bar"/);
+    expect(output).not.toMatch(/description/);
+  });
 });

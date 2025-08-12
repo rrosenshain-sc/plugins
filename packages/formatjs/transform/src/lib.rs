@@ -19,11 +19,11 @@ use swc_core::{
     },
     ecma::{
         ast::{
-            ArrayLit, AssignExpr, AssignTarget, Bool, CallExpr, Callee, Expr, ExprOrSpread, Id,
-            IdentName, JSXAttr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElementName,
-            JSXExpr, JSXNamespacedName, JSXOpeningElement, KeyValueProp, Lit, MemberProp,
-            ModuleItem, Number, ObjectLit, Pat, Prop, PropName, PropOrSpread, SimpleAssignTarget,
-            Str, VarDeclarator,
+            ArrayLit, AssignExpr, AssignTarget, BinExpr, BinaryOp, Bool, CallExpr, Callee, Expr,
+            ExprOrSpread, Id, IdentName, JSXAttr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue,
+            JSXElementName, JSXExpr, JSXNamespacedName, JSXOpeningElement, KeyValueProp, Lit,
+            MemberProp, ModuleItem, Number, ObjectLit, ParenExpr, Pat, Prop, PropName,
+            PropOrSpread, SimpleAssignTarget, Str, Tpl, VarDeclarator,
         },
         visit::{noop_visit_mut_type, VisitMut, VisitMutWith},
     },
@@ -31,6 +31,44 @@ use swc_core::{
 use swc_icu_messageformat_parser::{Parser, ParserOptions};
 
 pub static WHITESPACE_REGEX: Lazy<Regexp> = Lazy::new(|| Regexp::new(r"\s+").unwrap());
+
+// Try to evaluate an expression into a static string if possible.
+// Supports:
+// - String literals
+// - Template literals without expressions
+// - Parenthesized expressions
+// - Concatenation using "+" when both sides are statically evaluatable
+fn evaluate_string_expression(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+        Expr::Tpl(Tpl { quasis, exprs, .. }) => {
+            if exprs.is_empty() {
+                Some(
+                    quasis
+                        .iter()
+                        .map(|q| q.cooked.as_ref().map(|v| v.to_string()).unwrap_or_default())
+                        .collect::<Vec<String>>()
+                        .join("")
+                )
+            } else {
+                None
+            }
+        }
+        Expr::Paren(ParenExpr { expr, .. }) => evaluate_string_expression(expr),
+        Expr::Bin(BinExpr { op, left, right, .. }) => {
+            if *op == BinaryOp::Add {
+                if let (Some(l), Some(r)) = (
+                    evaluate_string_expression(left),
+                    evaluate_string_expression(right),
+                ) {
+                    return Some(format!("{}{}", l, r));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -168,25 +206,13 @@ fn get_jsx_message_descriptor_value(
             }
 
             match &container.expr {
-                JSXExpr::Expr(expr) => match &**expr {
-                    Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
-                    Expr::Tpl(tpl) => {
-                        //NOTE: This doesn't fully evaluate templates
-                        Some(
-                            tpl.quasis
-                                .iter()
-                                .map(|q| {
-                                    q.cooked
-                                        .as_ref()
-                                        .map(|v| v.to_string())
-                                        .unwrap_or("".to_string())
-                                })
-                                .collect::<Vec<String>>()
-                                .join(""),
-                        )
+                JSXExpr::Expr(expr) => {
+                    if let Some(s) = evaluate_string_expression(expr) {
+                        Some(s)
+                    } else {
+                        None
                     }
-                    _ => None,
-                },
+                }
                 _ => None,
             }
         }
@@ -205,25 +231,15 @@ fn get_call_expr_message_descriptor_value(
 
     let value = value.as_ref().expect("Should be available");
 
+    // Try to evaluate to a string if possible (handles literals, templates without expressions,
+    // parentheses, and concatenation via "+")
+    if let Some(s) = evaluate_string_expression(value) {
+        return Some(s);
+    }
+
     // NOTE: do not support evaluatePath
     match value {
         Expr::Ident(ident) => Some(ident.sym.to_string()),
-        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
-        Expr::Tpl(tpl) => {
-            //NOTE: This doesn't fully evaluate templates
-            Some(
-                tpl.quasis
-                    .iter()
-                    .map(|q| {
-                        q.cooked
-                            .as_ref()
-                            .map(|v| v.to_string())
-                            .unwrap_or("".to_string())
-                    })
-                    .collect::<Vec<String>>()
-                    .join(""),
-            )
-        }
         _ => None,
     }
 }
@@ -885,31 +901,38 @@ impl<C: Clone + Comments, S: SourceMapper> FormatJSVisitor<C, S> {
                 }
 
                 match &container.expr {
-                    JSXExpr::Expr(expr) => match &**expr {
-                        Expr::Lit(Lit::Str(s)) => {
-                            Some(MessageDescriptionValue::Str(s.value.to_string()))
-                        }
-                        Expr::Object(object_lit) => {
-                            Some(MessageDescriptionValue::Obj(object_lit.clone()))
-                        }
-                        // Handle React Compiler optimized identifiers
-                        Expr::Ident(ident) => {
-                            if let Some(resolved_expr) = self.resolve_identifier(ident) {
-                                match resolved_expr {
-                                    Expr::Object(object_lit) => {
-                                        Some(MessageDescriptionValue::Obj(object_lit.clone()))
-                                    }
-                                    Expr::Lit(Lit::Str(s)) => {
-                                        Some(MessageDescriptionValue::Str(s.value.to_string()))
-                                    }
-                                    _ => None,
+                    JSXExpr::Expr(expr) => {
+                        if let Some(s) = evaluate_string_expression(expr) {
+                            Some(MessageDescriptionValue::Str(s))
+                        } else {
+                            match &**expr {
+                                Expr::Object(object_lit) => {
+                                    Some(MessageDescriptionValue::Obj(object_lit.clone()))
                                 }
-                            } else {
-                                None
+                                // Handle React Compiler optimized identifiers
+                                Expr::Ident(ident) => {
+                                    if let Some(resolved_expr) = self.resolve_identifier(ident) {
+                                        match resolved_expr {
+                                            Expr::Object(object_lit) => {
+                                                Some(MessageDescriptionValue::Obj(
+                                                    object_lit.clone(),
+                                                ))
+                                            }
+                                            Expr::Lit(Lit::Str(s)) => Some(
+                                                MessageDescriptionValue::Str(
+                                                    s.value.to_string(),
+                                                ),
+                                            ),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
                             }
                         }
-                        _ => None,
-                    },
+                    }
                     _ => None,
                 }
             }
@@ -932,6 +955,9 @@ impl<C: Clone + Comments, S: SourceMapper> FormatJSVisitor<C, S> {
         let value = value.as_ref().expect("Should be available");
         // NOTE: do not support evaluatePath
         match value {
+            // Support string concatenation and other string-evaluable expressions
+            _ if evaluate_string_expression(value).is_some() => evaluate_string_expression(value)
+                .map(MessageDescriptionValue::Str),
             Expr::Ident(ident) => {
                 // First try to resolve the identifier to see if it's a variable reference
                 if let Some(resolved_expr) = self.resolve_identifier(ident) {
@@ -949,7 +975,6 @@ impl<C: Clone + Comments, S: SourceMapper> FormatJSVisitor<C, S> {
                     Some(MessageDescriptionValue::Str(ident.sym.to_string()))
                 }
             }
-            Expr::Lit(Lit::Str(s)) => Some(MessageDescriptionValue::Str(s.value.to_string())),
             Expr::Object(object_lit) => Some(MessageDescriptionValue::Obj(object_lit.clone())),
             _ => None,
         }
